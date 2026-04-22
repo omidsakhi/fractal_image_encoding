@@ -1,3 +1,19 @@
+# Generated artifacts
 *.png
 *.jpg
 *.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store

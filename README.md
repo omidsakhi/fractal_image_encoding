@@ -1,4 +1,4 @@
-# fractal_image_encoding
+# fractal-image-compression
 
 A from-scratch, NumPy-only implementation of **fractal image compression**: encode a grayscale image as a set of contractive affine maps, then reconstruct it by iterating those maps from a random seed until they converge to the image's attractor.
 
@@ -35,13 +35,13 @@ where `s` is a contractive scale factor and `b` is a brightness offset. The coll
 ## Layout
 
 ```
-fractal_image_encoding/
+fractal-image-compression/
 ├── main.py             CLI: --encode / --decode
 ├── encoder.py          Encoder + Transformation record + closed-form affine fit
 ├── decoder.py          Decoder (Banach fixed-point iteration from random seed)
 ├── integral.py         Summed-area table helper
 ├── utils.py            Domain pyramid helpers (D4 isometries × downsample levels)
-└── requirments.txt     Declared deps (see Dependencies below)
+└── requirements.txt    Python dependencies
 ```
 
 ## Usage
@@ -58,16 +58,18 @@ python main.py --decode transforms.csv --output reconstructed.png \
 
 The encoder converts RGB inputs to grayscale via `Image.convert('L')`. The decoder currently assumes a 256×256 output.
 
-## Dependencies
+## Install
 
-```
-numpy
-Pillow
-tqdm
-pandas
+```bash
+git clone https://github.com/omidsakhi/fractal-image-compression.git
+cd fractal-image-compression
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-(`requirments.txt` lists only `numpy` and `Pillow`; `tqdm` and `pandas` are also imported by the encoder/decoder.)
+Dependencies: `numpy`, `Pillow`, `tqdm`, `pandas`.
 
 ## Notes
 
@@ -75,3 +77,7 @@ pandas
 - Both `s` and `b` are quantized; this is the typical route to turning a continuous affine map into a cheap, compact record.
 - Pure NumPy — no OpenCV, no torch, no GPU. The search is O(|range blocks| · |domain blocks|) within each size class, so this is a readable study implementation, not a production codec. Expect a few minutes to encode a 256×256 image.
 - The `IntegralImage` helper (in `integral.py`, and duplicated inside `encoder.py`) is wired in as a potential optimization for fast block-sum queries but isn't on the active match path.
+
+## License
+
+Licensed under the Apache License 2.0 — see [LICENSE](LICENSE).
