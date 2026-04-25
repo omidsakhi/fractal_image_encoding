@@ -112,7 +112,6 @@ Dependencies: `numpy`, `Pillow`, `tqdm`.
 - Uses the standard Jacquin / Fisher framing with the D4 symmetry group on the domain pool — 8 isometries per size class.
 - Both `s` and `b` are quantized; this is the typical route to turning a continuous affine map into a cheap, compact record.
 - Pure NumPy — no OpenCV, no torch, no GPU. This is a readable study implementation, not a production codec.
-- The `IntegralImage` class in `encoder.py` is wired in as a potential optimization for fast block-sum queries but isn't on the active match path.
 
 ## License
 
