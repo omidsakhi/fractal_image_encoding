@@ -1,0 +1,14 @@
+[project]
+name = "fractal-image-compression"
+version = "0.1.0"
+description = "From-scratch NumPy implementation of fractal (PIFS) image compression"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pillow",
+    "tqdm",
+]
+
+[tool.uv]
+package = false

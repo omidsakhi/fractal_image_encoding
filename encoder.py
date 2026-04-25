@@ -1,8 +1,11 @@
+import gzip
+import json
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-import os
-import pandas as pd
 
 
 class Transformation:
@@ -33,14 +36,32 @@ class IntegralImage:
         return self.integral_image[y2, x2] - self.integral_image[y1, x2] - self.integral_image[y2, x1] + self.integral_image[y1, x1]
 
 class Encoder:
-    def __init__(self, image_path, max_domain_size=64, max_range_size=32, min_range_size=4, error_threshold=0.01, verbose=False):
+    def __init__(self, image_path, max_domain_size=64, max_range_size=32, min_range_size=4, error_threshold=0.01, batch_size=256, num_workers=1, verbose=False):
+        """
+        num_workers: number of threads used to process range-block chunks in
+            parallel within a size group. Defaults to 1 (serial). When raising
+            this, prefer to also pin BLAS to a single thread per chunk
+            (e.g. set OMP_NUM_THREADS=1 / MKL_NUM_THREADS=1 /
+            OPENBLAS_NUM_THREADS=1 in the environment) to avoid oversubscribing
+            cores, since np.tensordot is often already multi-threaded.
+        """
         self.max_domain_size = max_domain_size
         self.max_range_size = max_range_size
         self.min_range_size = min_range_size
-        self.error_threshold = error_threshold        
+        self.error_threshold = error_threshold
+        self.batch_size = batch_size
+        self.num_workers = max(1, int(num_workers))
         self.verbose = verbose
         
         self.image = np.array(Image.open(image_path).convert('L')) / 255.0
+        h, w = self.image.shape
+        if h % self.max_range_size != 0 or w % self.max_range_size != 0:
+            raise ValueError(
+                f"Image size {w}x{h} is not a multiple of max_range_size={self.max_range_size}. "
+                f"The initial range grid would leave edge pixels uncovered; use a size like "
+                f"{w - (w % self.max_range_size)}x{h - (h % self.max_range_size)} (crop) or "
+                f"pad to the next multiple of {self.max_range_size}."
+            )
 
         self.domain_images = [
             self.image,
@@ -58,25 +79,10 @@ class Encoder:
 
         self.info_range_blocks = []
         self.extract_range_blocks()
-    
-    def compute(self, range_block, domain_block):        
-        n = range_block.size
-        sum_r = np.sum(range_block)
-        sum_d = np.sum(domain_block)
-        sum_d2 = np.sum(domain_block**2)
-        sum_dr = np.sum(domain_block * range_block)
 
-        scale = (n * sum_dr - sum_d * sum_r) / (n * sum_d2 - sum_d**2)       
-        scale = np.clip(scale, 0, 0.95)
-        scale = np.round(scale * 7 / 0.95) * 0.95 / 7
-
-        bias = (sum_r - scale * sum_d) / n
-        bias = np.clip(bias, 0, 1)
-        bias = np.round(bias * 100) / 100
-
-        error = np.mean((range_block - (domain_block * scale + bias))**2)        
-
-        return scale, bias, error
+        # Cached per-output-size arrays of downsampled domain blocks plus their precomputed sums.
+        # Built lazily on first encode() call so construction stays cheap.
+        self._domain_cache = None
 
     def extract_range_blocks(self):
         
@@ -103,9 +109,6 @@ class Encoder:
                 for y in range(0, height - size + 1, step):
                     for x in range(0, width - size + 1, step):
                         for rot in range(len(self.domain_images)):
-                            domain_block = self.domain_images[rot][y:y+size, x:x+size]
-                            if scale > 1:
-                                domain_block = domain_block.reshape(size//scale, scale, size//scale, scale).mean(axis=(1,3))
                             self.info_domain_blocks.append((rot, x, y, size, scale))
             size = size // 2
         
@@ -113,6 +116,40 @@ class Encoder:
 
         if self.verbose:
             print(f"Extracted {len(self.info_domain_blocks)} domain blocks")
+
+    def _build_domain_cache(self):
+        """Group domain blocks by their downsampled output size and precompute
+        the actual block arrays plus per-block sums. This is what allows the
+        encode loop to vectorize across all domain candidates for a range size.
+        """
+        cache = {}
+        by_size = {}
+        for info in self.info_domain_blocks:
+            di, dx, dy, dsize, dscale = info
+            out_size = dsize // dscale
+            by_size.setdefault(out_size, []).append(info)
+
+        for out_size, infos in by_size.items():
+            blocks = np.empty((len(infos), out_size, out_size), dtype=self.image.dtype)
+            for i, (di, dx, dy, dsize, dscale) in enumerate(infos):
+                d = self.domain_images[di][dy:dy+dsize, dx:dx+dsize]
+                if dscale > 1:
+                    d = d.reshape(out_size, dscale, out_size, dscale).mean(axis=(1, 3))
+                blocks[i] = d
+            sum_d = blocks.sum(axis=(1, 2))
+            sum_d2 = (blocks * blocks).sum(axis=(1, 2))
+            cache[out_size] = {
+                'blocks': blocks,
+                'info': infos,
+                'sum_d': sum_d,
+                'sum_d2': sum_d2,
+            }
+
+        self._domain_cache = cache
+
+        if self.verbose:
+            for out_size, entry in cache.items():
+                print(f"  cached {len(entry['info'])} domain blocks at output size {out_size}")
 
     def save_domain_sources(self, output_dir):
         if not os.path.exists(output_dir):
@@ -140,89 +177,214 @@ class Encoder:
         print("error: ", transform.error)
 
     def encode(self):
+        if self._domain_cache is None:
+            self._build_domain_cache()
+
         transforms = []
         coverage = np.zeros_like(self.image)
         total_pixels = np.prod(self.image.shape)
-        
-        with tqdm(total=100, desc="Encoding Progress", unit="%") as pbar:
-            while self.info_range_blocks:                   
-                current_range_info = self.info_range_blocks.pop()            
-                rx, ry, rsize = current_range_info            
-                range_block = self.image[ry:ry+rsize, rx:rx+rsize]            
-                best_transform = None
-                best_error = float('inf')                 
-                filtered_domain_blocks = list(filter(lambda x: x[3] // x[4] == rsize, self.info_domain_blocks))                
-                assert len(filtered_domain_blocks) > 0
-                for domain_block_info in filtered_domain_blocks:
-                    di, dx, dy, dsize, dscale = domain_block_info                
-                    domain_block = self.domain_images[di][dy:dy+dsize, dx:dx+dsize]
-                    if dscale > 1:
-                        domain_block = domain_block.reshape(dsize//dscale, dscale, dsize//dscale, dscale).mean(axis=(1,3))                
-                    scale, bias, error = self.compute(range_block, domain_block)
-                    if error < best_error:
-                        best_error = error
-                        transform = Transformation()
-                        transform.domain_source_index = di
-                        transform.domain_x = dx
-                        transform.domain_y = dy
-                        transform.domain_size = dsize
-                        transform.domain_scale = dscale
-                        transform.range_x = rx
-                        transform.range_y = ry
-                        transform.range_size = rsize
-                        transform.scale = scale
-                        transform.bias = bias
-                        transform.error = error
-                        best_transform = transform
-                    
-                    if best_error <= self.error_threshold:
-                        break
 
-                if best_error <= self.error_threshold or rsize <= self.min_range_size:
-                    transforms.append(best_transform)
-                    coverage[ry:ry+rsize, rx:rx+rsize] = 1
+        # Work queue of range blocks waiting to be matched. Adaptive subdivision
+        # appends smaller children here.
+        pending = list(self.info_range_blocks)
+        self.info_range_blocks = []
+
+        with tqdm(total=100, desc="Encoding Progress", unit="%") as pbar:
+            while pending:
+                # Group pending range blocks by size so we can share the cached
+                # domain array (and one big tensordot) across each batch.
+                by_size = {}
+                for info in pending:
+                    by_size.setdefault(info[2], []).append(info)
+                pending = []
+
+                for rsize, infos in by_size.items():
+                    domain = self._domain_cache.get(rsize)
+                    assert domain is not None, f"no domain blocks cached for range size {rsize}"
+
+                    new_pending, new_transforms = self._encode_size_group(
+                        rsize, infos, domain, coverage,
+                    )
+                    transforms.extend(new_transforms)
+                    pending.extend(new_pending)
+
                     current_coverage = np.sum(coverage) / total_pixels * 100
                     pbar.n = int(current_coverage)
                     pbar.refresh()
-                else:
-                    half_size = rsize // 2
-                    self.info_range_blocks.extend([
-                        (rx, ry, half_size),
-                        (rx + half_size, ry, half_size),
-                        (rx, ry + half_size, half_size),
-                        (rx + half_size, ry + half_size, half_size)
-                    ])
 
         if self.verbose:
             print(f"Found {len(transforms)} transforms")
 
         return transforms
 
-    def save_transforms_to_csv(self, transforms, filename='transforms.csv'):
-        
-        # Create a list of dictionaries, each representing a transform
-        transform_data = []
-        for t in transforms:
-            transform_data.append({
-                'domain_source_index': t.domain_source_index,
-                'domain_x': t.domain_x,
-                'domain_y': t.domain_y,
-                'domain_size': t.domain_size,
-                'domain_scale': t.domain_scale,
-                'range_x': t.range_x,
-                'range_y': t.range_y,
-                'range_size': t.range_size,
-                'scale': t.scale,
-                'bias': t.bias,
-                'error': t.error
-            })
-        
-        # Create a DataFrame from the list of dictionaries
-        df = pd.DataFrame(transform_data)
-        
-        # Save the DataFrame to a CSV file
-        df.to_csv(filename, index=False)
-        
+    def _encode_size_group(self, rsize, range_infos, domain, coverage):
+        """Match every range block in `range_infos` (all of size `rsize`) against
+        every cached domain block of the same output size. Returns the list of
+        accepted Transformations plus any range blocks that need to be subdivided.
+
+        Range blocks are processed in chunks of `self.batch_size` to bound the
+        (K, M) intermediate. When `self.num_workers > 1`, chunks are dispatched
+        to a thread pool; the heavy lifting (`np.tensordot` plus elementwise
+        ops) releases the GIL so threads make progress in parallel.
+        """
+        n = rsize * rsize
+        denom = n * domain['sum_d2'] - domain['sum_d'] ** 2  # (M,)
+        denom_safe = np.where(denom == 0, 1.0, denom)
+        ctx = {
+            'rsize': rsize,
+            'n': n,
+            'D': domain['blocks'],
+            'sum_d': domain['sum_d'],
+            'sum_d2': domain['sum_d2'],
+            'domain_info': domain['info'],
+            'denom': denom,
+            'denom_safe': denom_safe,
+        }
+
+        chunks = [
+            range_infos[i:i + self.batch_size]
+            for i in range(0, len(range_infos), self.batch_size)
+        ]
+
+        if self.num_workers > 1 and len(chunks) > 1:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as ex:
+                results = list(ex.map(lambda c: self._process_range_chunk(c, ctx), chunks))
+        else:
+            results = [self._process_range_chunk(c, ctx) for c in chunks]
+
+        # Merge chunk results back on the main thread so coverage and the
+        # transform list don't need locking inside the workers.
+        transforms = []
+        next_pending = []
+        for chunk_transforms, chunk_pending, chunk_accepted in results:
+            transforms.extend(chunk_transforms)
+            next_pending.extend(chunk_pending)
+            for rx, ry in chunk_accepted:
+                coverage[ry:ry + rsize, rx:rx + rsize] = 1
+
+        return next_pending, transforms
+
+    def _process_range_chunk(self, chunk, ctx):
+        """Pure worker: matches one chunk of range blocks (all the same size)
+        against the cached domain pool. Returns (transforms, subdivided_pending,
+        accepted_coords) without touching any Encoder state, so it is safe to
+        run from a worker thread.
+        """
+        rsize = ctx['rsize']
+        n = ctx['n']
+        D = ctx['D']
+        sum_d = ctx['sum_d']
+        sum_d2 = ctx['sum_d2']
+        domain_info = ctx['domain_info']
+        denom = ctx['denom']
+        denom_safe = ctx['denom_safe']
+
+        K = len(chunk)
+        R = np.empty((K, rsize, rsize), dtype=self.image.dtype)
+        for i, (rx, ry, _) in enumerate(chunk):
+            R[i] = self.image[ry:ry + rsize, rx:rx + rsize]
+
+        sum_r = R.sum(axis=(1, 2))                          # (K,)
+        sum_r2 = (R * R).sum(axis=(1, 2))                   # (K,)
+        sum_dr = np.tensordot(R, D, axes=([1, 2], [1, 2]))  # (K, M)
+
+        # Same regression as the original compute(), just broadcast over (K, M).
+        num = n * sum_dr - sum_d[None, :] * sum_r[:, None]
+        scale = np.where(denom[None, :] == 0, 0.0, num / denom_safe[None, :])
+        scale = np.clip(scale, 0.0, 0.95)
+        bias = np.where(
+            denom[None, :] == 0,
+            sum_r[:, None] / n,
+            (sum_r[:, None] - scale * sum_d[None, :]) / n,
+        )
+
+        # Quantization (matches original compute() exactly).
+        scale = np.round(scale * 7 / 0.95) * 0.95 / 7
+        bias = np.clip(bias, 0.0, 1.0)
+        bias = np.round(bias * 100) / 100
+
+        # Closed-form MSE from the precomputed sums.
+        error = (
+            sum_r2[:, None]
+            - 2.0 * scale * sum_dr
+            - 2.0 * bias * sum_r[:, None]
+            + scale ** 2 * sum_d2[None, :]
+            + 2.0 * scale * bias * sum_d[None, :]
+            + n * bias ** 2
+        ) / n
+
+        best_m = np.argmin(error, axis=1)
+        row_idx = np.arange(K)
+        best_error = error[row_idx, best_m]
+        best_scale = scale[row_idx, best_m]
+        best_bias = bias[row_idx, best_m]
+
+        transforms = []
+        next_pending = []
+        accepted = []
+        for k, (rx, ry, _) in enumerate(chunk):
+            m = int(best_m[k])
+            err = float(best_error[k])
+
+            if err <= self.error_threshold or rsize <= self.min_range_size:
+                di, dx, dy, dsize, dscale = domain_info[m]
+                t = Transformation()
+                t.domain_source_index = di
+                t.domain_x = dx
+                t.domain_y = dy
+                t.domain_size = dsize
+                t.domain_scale = dscale
+                t.range_x = rx
+                t.range_y = ry
+                t.range_size = rsize
+                t.scale = float(best_scale[k])
+                t.bias = float(best_bias[k])
+                t.error = err
+                transforms.append(t)
+                accepted.append((rx, ry))
+            else:
+                half = rsize // 2
+                next_pending.extend([
+                    (rx, ry, half),
+                    (rx + half, ry, half),
+                    (rx, ry + half, half),
+                    (rx + half, ry + half, half),
+                ])
+
+        return transforms, next_pending, accepted
+
+    def save_transforms(self, transforms, filename='transforms.json'):
+        image_height, image_width = self.image.shape
+        records = [
+            {
+                'domain_source_index': int(t.domain_source_index),
+                'domain_x': int(t.domain_x),
+                'domain_y': int(t.domain_y),
+                'domain_size': int(t.domain_size),
+                'domain_scale': int(t.domain_scale),
+                'range_x': int(t.range_x),
+                'range_y': int(t.range_y),
+                'range_size': int(t.range_size),
+                'scale': float(t.scale),
+                'bias': float(t.bias),
+                'error': float(t.error),
+            }
+            for t in transforms
+        ]
+        doc = {
+            'format': 'fractal-pifs',
+            'version': 1,
+            'image_height': int(image_height),
+            'image_width': int(image_width),
+            'transforms': records,
+        }
+        if filename.endswith('.gz'):
+            with gzip.open(filename, 'wt', encoding='utf-8') as f:
+                json.dump(doc, f)
+        else:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(doc, f, indent=2)
+
         if self.verbose:
             print(f"Transforms saved to {filename}")
 
