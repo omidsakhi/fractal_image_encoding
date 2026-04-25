@@ -2,6 +2,8 @@
 *.png
 *.jpg
 *.csv
+!examples/*.png
+!examples/*.jpg
 
 # Python
 __pycache__/
